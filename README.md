@@ -2,6 +2,14 @@
 
 An end-to-end data analytics project that collects fashion e-commerce product data, stores it in a relational database, applies AI-based text analysis, and presents the findings through an interactive Power BI dashboard.
 
+## Live Dashboard
+
+An interactive web version of this dashboard is available as a standalone HTML page:
+
+**[View Live Dashboard](https://anushar-214.github.io/Fashion-Analysis---On-Salty-alpha---Project-5/fashion_analytics_dashboard.html)**
+
+File: `fashion_analytics_dashboard.html` — open it directly in any browser, no Power BI Desktop required.
+
 ---
 
 ## Overview
