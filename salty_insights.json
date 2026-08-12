@@ -1,0 +1,207 @@
+{
+  "kpis": {
+    "products": 20,
+    "average_price": 766.0,
+    "median_price": 799.0,
+    "highest_price": 1799.0,
+    "highest_name": "Lavish Lavender Jewellery Gift Box for Her",
+    "lowest_price": 99.0,
+    "lowest_name": "Make it a Gift!",
+    "total_savings": 11094.0,
+    "blended_discount": 42.0,
+    "categories": 0
+  },
+  "insights": [
+    {
+      "tone": "",
+      "icon": "i-scales",
+      "title": "Price spread",
+      "text": "The catalogue runs from <em>₹99</em> to <em>₹1,799</em>, a <em>18.2×</em> range. The most expensive listing is <em>Lavish Lavender Jewellery Gift Box for Her</em>."
+    },
+    {
+      "tone": "good",
+      "icon": "i-target",
+      "title": "Evenly distributed pricing",
+      "text": "Mean <em>₹766</em> and median <em>₹799</em> land within <em>4%</em> of each other, so there is no strong skew."
+    },
+    {
+      "tone": "warn",
+      "icon": "i-alert",
+      "title": "One discount dominates",
+      "text": "<em>11 of 20</em> products (<em>55%</em>) carry exactly <em>50% off</em>. That is a blanket store-wide rule rather than per-product pricing, which limits what discount analysis can reveal."
+    },
+    {
+      "tone": "warn",
+      "icon": "i-layers",
+      "title": "Savings are concentrated",
+      "text": "The top <em>6 products</em> (<em>30%</em> of the range) account for half of all <em>₹11,094</em> in savings. <em>Red HeartBeat Gift Box</em> alone contributes <em>₹1,500</em>."
+    },
+    {
+      "tone": "warn",
+      "icon": "i-tag",
+      "title": "Blended discount",
+      "text": "<em>₹11,094</em> comes off <em>₹26,414</em> of original value — an effective <em>42.0%</em> discount. That is a normal promotional range."
+    },
+    {
+      "tone": "",
+      "icon": "i-target",
+      "title": "Charm pricing is the house style",
+      "text": "<em>12 of 20</em> prices end in 99 (<em>60%</em>). Pricing is set by psychological anchor, so price is a weak proxy for product value here."
+    },
+    {
+      "tone": "good",
+      "icon": "i-spark",
+      "title": "Title sentiment",
+      "text": "<em>7 positive</em>, <em>10 neutral</em>, <em>3 negative</em> across <em>20</em> product titles. Titles are descriptive rather than evaluative, so treat this as a text-processing demonstration, not a customer signal."
+    },
+    {
+      "tone": "good",
+      "icon": "i-coins",
+      "title": "Deepest value",
+      "text": "<em>Linked by Love Knot Bracelet - Silver</em> returns <em>₹2.01</em> saved per rupee spent — the strongest discount-to-price ratio in the catalogue."
+    },
+    {
+      "tone": "",
+      "icon": "i-spark",
+      "title": "Dominant motif",
+      "text": "<em>Box</em> appears in <em>5 products</em> (<em>25.0%</em> of the catalogue), averaging <em>₹1,339</em> at <em>33%</em> off. It is the single most repeated theme in the range."
+    },
+    {
+      "tone": "",
+      "icon": "i-pie",
+      "title": "Leading colour",
+      "text": "<em>Red</em> leads on colour with <em>3 products</em> (<em>15.0%</em>), averaging <em>₹732</em>."
+    },
+    {
+      "tone": "",
+      "icon": "i-layers",
+      "title": "Leading material",
+      "text": "<em>Crystal</em> is the most common material at <em>3 products</em> (<em>15.0%</em>)."
+    }
+  ],
+  "trends": {
+    "motifs": [
+      {
+        "term": "Box",
+        "count": 5,
+        "share": 25.0,
+        "avg_price": 1339,
+        "avg_discount": 33
+      },
+      {
+        "term": "Bracelet",
+        "count": 4,
+        "share": 20.0,
+        "avg_price": 534,
+        "avg_discount": 46
+      },
+      {
+        "term": "Rakhi",
+        "count": 4,
+        "share": 20.0,
+        "avg_price": 299,
+        "avg_discount": 50
+      },
+      {
+        "term": "Crystal",
+        "count": 3,
+        "share": 15.0,
+        "avg_price": 462,
+        "avg_discount": 55
+      },
+      {
+        "term": "Bhaiya",
+        "count": 3,
+        "share": 15.0,
+        "avg_price": 316,
+        "avg_discount": 50
+      },
+      {
+        "term": "Bhabhi",
+        "count": 3,
+        "share": 15.0,
+        "avg_price": 316,
+        "avg_discount": 50
+      },
+      {
+        "term": "Red",
+        "count": 3,
+        "share": 15.0,
+        "avg_price": 732,
+        "avg_discount": 50
+      },
+      {
+        "term": "Tulip",
+        "count": 2,
+        "share": 10.0,
+        "avg_price": 519,
+        "avg_discount": 50
+      },
+      {
+        "term": "Vine",
+        "count": 2,
+        "share": 10.0,
+        "avg_price": 519,
+        "avg_discount": 50
+      },
+      {
+        "term": "Linked",
+        "count": 2,
+        "share": 10.0,
+        "avg_price": 549,
+        "avg_discount": 52
+      },
+      {
+        "term": "Love",
+        "count": 2,
+        "share": 10.0,
+        "avg_price": 549,
+        "avg_discount": 52
+      },
+      {
+        "term": "Pearl",
+        "count": 2,
+        "share": 10.0,
+        "avg_price": 249,
+        "avg_discount": 50
+      }
+    ],
+    "colours": [
+      {
+        "term": "Red",
+        "count": 3,
+        "share": 15.0,
+        "avg_price": 732
+      },
+      {
+        "term": "Gold",
+        "count": 2,
+        "share": 10.0,
+        "avg_price": 624
+      },
+      {
+        "term": "Black",
+        "count": 2,
+        "share": 10.0,
+        "avg_price": 874
+      }
+    ],
+    "materials": [
+      {
+        "term": "Crystal",
+        "count": 3,
+        "share": 15.0,
+        "avg_price": 462
+      },
+      {
+        "term": "Pearl",
+        "count": 2,
+        "share": 10.0,
+        "avg_price": 249
+      }
+    ],
+    "launches": [],
+    "has_stock": false,
+    "has_dates": false
+  }
+}

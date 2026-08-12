@@ -1,0 +1,1227 @@
+# -*- coding: utf-8 -*-
+"""
+Salty Fashion Analytics — full pipeline
+=======================================
+
+One file. Scrapes the catalogue, cleans it, runs the analysis, and writes a
+self-contained dashboard with the results baked in.
+
+    pip install requests pandas
+    pip install textblob                     # optional, for sentiment
+    python -m textblob.download_corpora      # optional
+
+Run it:
+
+    python salty_analytics.py                     # scrape live, then build
+    python salty_analytics.py --offline my.csv    # skip scraping, use a CSV
+    python salty_analytics.py --limit 5           # scrape only 5 pages (test)
+
+Outputs, written next to this script:
+
+    salty_cleaned.csv                 cleaned data
+    salty_insights.json               the analysis, as data
+    fashion_analytics_dashboard.html  the dashboard, opens in any browser
+"""
+
+import argparse
+import json
+import sys
+import time
+from pathlib import Path
+
+import pandas as pd
+import requests
+
+BASE = "https://salty.co.in"
+COLLECTION = "all-products"     # 1,537 products; use "all" for the whole store
+PER_PAGE = 250                  # Shopify's maximum per request
+DELAY = 1.0                     # seconds between requests
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; portfolio-project/1.0)"}
+OUT = Path(__file__).resolve().parent
+
+
+# ======================================================================
+# 1. SCRAPE
+# ======================================================================
+def fetch_products(collection=COLLECTION, max_pages=50):
+    """
+    salty.co.in runs on Shopify, which serves the catalogue as JSON at
+    /products.json. That avoids Selenium, infinite scroll and HTML parsing
+    entirely, and it exposes product_type (category), which the rendered
+    product cards do not.
+    """
+    rows, page = [], 1
+
+    while page <= max_pages:
+        url = f"{BASE}/collections/{collection}/products.json"
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=30,
+                                params={"limit": PER_PAGE, "page": page})
+        except requests.RequestException as e:
+            print(f"  page {page}: request failed ({e}), stopping")
+            break
+
+        if resp.status_code != 200:
+            print(f"  page {page}: HTTP {resp.status_code}, stopping")
+            break
+
+        products = resp.json().get("products", [])
+        if not products:
+            print(f"  page {page}: empty, done")
+            break
+
+        for p in products:
+            variant = (p.get("variants") or [{}])[0]
+            price = variant.get("price")
+            compare = variant.get("compare_at_price")
+            rows.append({
+                "Product_Name": (p.get("title") or "").strip(),
+                "Price":     float(price) if price else None,
+                "Old_Price": float(compare) if compare else None,
+                "Category":  (p.get("product_type") or "").strip() or None,
+                "Tags":      ", ".join(p.get("tags") or []) or None,
+                "Available": variant.get("available"),
+                "URL":       f"{BASE}/products/{p.get('handle')}",
+                "Image":     ((p.get("images") or [{}])[0] or {}).get("src"),
+            })
+
+        print(f"  page {page}: {len(products):>3} products  (total {len(rows)})")
+        page += 1
+        time.sleep(DELAY)
+
+    return pd.DataFrame(rows)
+
+
+# ======================================================================
+# 2. CLEAN
+# ======================================================================
+def dedupe_title(s):
+    """
+    The product cards render each title twice, so HTML scraping yields
+    'Red BoxRed Box'. This was corrupting every chart label. products.json
+    is clean, but the guard stays in for CSVs scraped the old way.
+    """
+    s = str(s).strip()
+    half = len(s) // 2
+    return s[:half] if (len(s) % 2 == 0 and half and s[:half] == s[half:]) else s
+
+
+def to_number(series):
+    """
+    Handles 'Rs. 1,299', '₹1,039', '50% OFF', '1299.0'.
+
+    Note the trap: naively deleting every non-digit except '.' turns 'Rs. 1299'
+    into '.1299', which parses as 0.1299 and silently destroys every price.
+    Drop separators first, then extract the first complete number.
+    """
+    s = series.astype(str).str.replace(",", "", regex=False)
+    return pd.to_numeric(s.str.extract(r"(-?\d+(?:\.\d+)?)", expand=False), errors="coerce")
+
+
+def clean(df):
+    df = df.copy()
+    df.columns = [c.strip() for c in df.columns]
+
+    # tolerate common header variations from older CSVs
+    renames = {"name": "Product_Name", "title": "Product_Name", "product": "Product_Name",
+               "mrp": "Old_Price", "original_price": "Old_Price",
+               "selling_price": "Price", "product_category": "Category"}
+    df.rename(columns={c: renames[c.lower()] for c in df.columns
+                       if c.lower() in renames}, inplace=True)
+
+    if "Product_Name" not in df or "Price" not in df:
+        sys.exit("ERROR: need at least Product_Name and Price columns.")
+
+    df["Product_Name"] = df["Product_Name"].map(dedupe_title)
+    df = df[df["Product_Name"].str.len() > 0]
+
+    df["Price"] = to_number(df["Price"])
+    df = df.dropna(subset=["Price"])
+    df = df[df["Price"] > 0]
+
+    # Old_Price was previously cleaned but never cast, so it stayed a string
+    # and every savings figure downstream came out wrong.
+    if "Old_Price" in df:
+        df["Old_Price"] = to_number(df["Old_Price"])
+    else:
+        df["Old_Price"] = None
+
+    if "Discount" in df:
+        stated = to_number(df["Discount"])
+        missing = df["Old_Price"].isna() & stated.between(1, 99)
+        df.loc[missing, "Old_Price"] = (df.loc[missing, "Price"] /
+                                        (1 - stated[missing] / 100)).round()
+
+    df["Old_Price"] = df["Old_Price"].fillna(df["Price"])
+    df.loc[df["Old_Price"] < df["Price"], "Old_Price"] = df["Price"]
+
+    # recompute rather than trust the badge — they disagree on real listings
+    df["Savings"] = (df["Old_Price"] - df["Price"]).round(2)
+    df["Discount"] = ((df["Savings"] / df["Old_Price"]) * 100).round().astype(int)
+
+    if "Category" not in df:
+        df["Category"] = None
+    df["Category"] = df["Category"].fillna("Uncategorised")
+
+    key = "URL" if "URL" in df else "Product_Name"
+    before = len(df)
+    df = df.drop_duplicates(subset=[key]).reset_index(drop=True)
+    if before != len(df):
+        print(f"  removed {before - len(df)} duplicate rows")
+
+    df["Price_Band"] = pd.cut(
+        df["Price"], bins=[0, 300, 600, 1000, 1500, float("inf")],
+        labels=["Under 300", "300-599", "600-999", "1000-1499", "1500+"], right=False)
+
+    return df
+
+
+def add_sentiment(df, column="Product_Name"):
+    """
+    Honest note: TextBlob scores opinion words, and product titles are
+    descriptive rather than evaluative, so most score exactly 0.0. The column
+    is here because the brief asks for it and because it becomes genuinely
+    useful the moment you point it at scraped review text instead of titles.
+    """
+    try:
+        from textblob import TextBlob
+    except ImportError:
+        print("  textblob not installed, skipping sentiment")
+        return df
+
+    df = df.copy()
+    df["Polarity"] = df[column].map(lambda t: round(TextBlob(str(t)).sentiment.polarity, 3))
+    df["Sentiment"] = pd.cut(df["Polarity"], bins=[-1.001, -0.05, 0.05, 1.0],
+                             labels=["Negative", "Neutral", "Positive"]).astype(str)
+    flat = (df["Polarity"] == 0).mean()
+    if flat > 0.7:
+        print(f"  note: {flat:.0%} of titles scored 0.0 polarity — expected for titles")
+    return df
+
+
+# ======================================================================
+# 3. ANALYSE
+# ======================================================================
+def analyse(df):
+    """Everything the dashboard displays is computed here, not in the browser."""
+    n = len(df)
+    price, old, save = df["Price"], df["Old_Price"], df["Savings"]
+    total_save, total_old = save.sum(), old.sum()
+    mean, med = price.mean(), price.median()
+    ins = []
+
+    def add(tone, icon, title, text):
+        ins.append({"tone": tone, "icon": icon, "title": title, "text": text})
+
+    rupee = lambda v: f"₹{round(v):,}"
+
+    # spread
+    hi, lo = df.loc[price.idxmax()], df.loc[price.idxmin()]
+    add("", "i-scales", "Price spread",
+        f"The catalogue runs from <em>{rupee(lo.Price)}</em> to <em>{rupee(hi.Price)}</em>, "
+        f"a <em>{hi.Price / lo.Price:.1f}×</em> range. The most expensive listing is "
+        f"<em>{hi.Product_Name}</em>.")
+
+    # skew
+    skew = (mean - med) / med if med else 0
+    if abs(skew) > 0.1:
+        add("", "i-trend",
+            "Pulled up by premium items" if skew > 0 else "Pulled down by cheap items",
+            f"Average price is <em>{rupee(mean)}</em> but the median is <em>{rupee(med)}</em>. "
+            + ("A small number of expensive listings drag the mean above where most products "
+               "actually sit, so quote the median when describing typical pricing."
+               if skew > 0 else
+               "A cluster of low-priced items sits below the bulk of the range."))
+    else:
+        add("good", "i-target", "Evenly distributed pricing",
+            f"Mean <em>{rupee(mean)}</em> and median <em>{rupee(med)}</em> land within "
+            f"<em>{abs(skew) * 100:.0f}%</em> of each other, so there is no strong skew.")
+
+    # discount concentration
+    counts = df["Discount"].value_counts()
+    top_d, top_c = counts.index[0], counts.iloc[0]
+    share = top_c / n
+    if share >= 0.3:
+        add("warn" if share >= 0.5 else "", "i-alert", "One discount dominates",
+            f"<em>{top_c} of {n}</em> products (<em>{share:.0%}</em>) carry exactly "
+            f"<em>{top_d}% off</em>. That is a blanket store-wide rule rather than "
+            f"per-product pricing, which limits what discount analysis can reveal.")
+    else:
+        add("", "i-pie", "Varied discounting",
+            f"Discounts spread across <em>{counts.size}</em> distinct levels, the most "
+            f"common being <em>{top_d}% off</em> on <em>{top_c}</em> products.")
+
+    # pareto
+    if total_save > 0:
+        ranked = df.sort_values("Savings", ascending=False)
+        k = int((ranked["Savings"].cumsum() < total_save / 2).sum()) + 1
+        add("warn" if k / n <= 0.3 else "", "i-layers", "Savings are concentrated",
+            f"The top <em>{k} products</em> (<em>{k / n:.0%}</em> of the range) account for "
+            f"half of all <em>{rupee(total_save)}</em> in savings. "
+            f"<em>{ranked.iloc[0].Product_Name}</em> alone contributes "
+            f"<em>{rupee(ranked.iloc[0].Savings)}</em>.")
+
+    # blended discount
+    blended = total_save / total_old * 100 if total_old else 0
+    add("flag" if blended > 45 else "warn" if blended > 30 else "good", "i-tag",
+        "Blended discount",
+        f"<em>{rupee(total_save)}</em> comes off <em>{rupee(total_old)}</em> of original "
+        f"value — an effective <em>{blended:.1f}%</em> discount. "
+        + ("Sustained discounting this deep usually means list prices are inflated rather "
+           "than genuinely reduced." if blended > 45 else "That is a normal promotional range."))
+
+    # charm pricing
+    charm = int((price % 100 == 99).sum())
+    if charm / n >= 0.25:
+        add("", "i-target", "Charm pricing is the house style",
+            f"<em>{charm} of {n}</em> prices end in 99 (<em>{charm / n:.0%}</em>). Pricing is "
+            f"set by psychological anchor, so price is a weak proxy for product value here.")
+
+    # outliers
+    q1, q3 = price.quantile(.25), price.quantile(.75)
+    iqr = q3 - q1
+    outs = df[(price > q3 + 1.5 * iqr) | (price < q1 - 1.5 * iqr)]
+    if len(outs):
+        names = ", ".join(outs.nlargest(3, "Price")["Product_Name"].str.slice(0, 28))
+        add("flag", "i-alert", "Price outliers",
+            f"<em>{len(outs)}</em> product(s) sit outside the normal range of "
+            f"<em>{rupee(q1)}–{rupee(q3)}</em>: <em>{names}</em>"
+            f"{' and others' if len(outs) > 3 else ''}. Check these before averaging.")
+
+    # full-price items
+    full = int((df["Discount"] == 0).sum())
+    if full:
+        add("", "i-box", "Undiscounted items",
+            f"<em>{full}</em> product(s) (<em>{full / n:.0%}</em>) carry no discount at all. "
+            f"They flatten the average savings figure and are worth excluding from "
+            f"discount-depth analysis.")
+
+    # categories
+    cats = df[df["Category"] != "Uncategorised"]
+    if cats["Category"].nunique() > 1:
+        by_count = cats["Category"].value_counts()
+        by_value = cats.groupby("Category")["Price"].sum().sort_values(ascending=False)
+        add("", "i-grid", "Category mix",
+            f"<em>{by_count.size}</em> categories present. <em>{by_count.index[0]}</em> leads "
+            f"on count with <em>{by_count.iloc[0]} products</em> "
+            f"(<em>{by_count.iloc[0] / len(cats):.0%}</em>), while <em>{by_value.index[0]}</em> "
+            f"carries the most catalogue value at <em>{rupee(by_value.iloc[0])}</em>.")
+
+        deep = cats.groupby("Category")["Discount"].mean().sort_values(ascending=False)
+        add("", "i-bars", "Discount depth by category",
+            f"<em>{deep.index[0]}</em> is discounted hardest at <em>{deep.iloc[0]:.0f}%</em> "
+            f"on average, against <em>{deep.iloc[-1]:.0f}%</em> for <em>{deep.index[-1]}</em>.")
+
+    # sentiment
+    if "Sentiment" in df and df["Sentiment"].notna().any():
+        s = df["Sentiment"].value_counts()
+        pos, neu, neg = int(s.get("Positive", 0)), int(s.get("Neutral", 0)), int(s.get("Negative", 0))
+        add("good" if pos > neg * 2 else "flag" if neg > pos else "", "i-spark",
+            "Title sentiment",
+            f"<em>{pos} positive</em>, <em>{neu} neutral</em>, <em>{neg} negative</em> across "
+            f"<em>{n}</em> product titles. Titles are descriptive rather than evaluative, so "
+            f"treat this as a text-processing demonstration, not a customer signal.")
+
+    # best value
+    ratio = (save / price).replace([float("inf")], 0)
+    if ratio.max() > 0:
+        best = df.loc[ratio.idxmax()]
+        add("good", "i-coins", "Deepest value",
+            f"<em>{best.Product_Name}</em> returns <em>₹{best.Savings / best.Price:.2f}</em> "
+            f"saved per rupee spent — the strongest discount-to-price ratio in the catalogue.")
+
+    kpis = {
+        "products": int(n),
+        "average_price": round(float(mean), 2),
+        "median_price": round(float(med), 2),
+        "highest_price": round(float(price.max()), 2),
+        "highest_name": str(df.loc[price.idxmax(), "Product_Name"]),
+        "lowest_price": round(float(price.min()), 2),
+        "lowest_name": str(df.loc[price.idxmin(), "Product_Name"]),
+        "total_savings": round(float(total_save), 2),
+        "blended_discount": round(float(blended), 1),
+        "categories": int(cats["Category"].nunique()),
+    }
+    return kpis, ins
+
+
+# ======================================================================
+# 4. TREND ANALYSIS
+# ======================================================================
+STOPWORDS = {
+    "the", "and", "for", "with", "her", "his", "him", "you", "your", "our",
+    "set", "of", "in", "on", "to", "a", "an", "by", "from", "free", "new",
+    "salty", "gift", "pack", "combo", "style", "design", "women", "men",
+    "womens", "mens", "girls", "boys", "piece", "pcs", "size", "color",
+    "colour", "make", "it", "is", "are", "best", "top",
+}
+
+COLOURS = ["rose gold", "gold", "silver", "black", "white", "pink", "purple",
+           "blue", "green", "red", "multi", "yellow", "brown", "grey"]
+
+MATERIALS = ["pearl", "crystal", "stainless steel", "copper", "alloy", "bead",
+             "stone", "zircon", "resin", "leather", "thread", "acrylic", "enamel"]
+
+
+def trend_analysis(df, top_n=12):
+    """
+    What's actually trending, using signals the catalogue really carries.
+
+    The strongest one is sell-out rate: an out-of-stock product sold through,
+    so the share of unavailable items in a theme is a demand proxy rather than
+    a guess. Launch recency is the second — what the brand chose to add most
+    recently is what it is betting on now.
+    """
+    import re
+    from collections import Counter
+
+    n = len(df)
+    out = {"motifs": [], "colours": [], "materials": [], "launches": [],
+           "has_stock": False, "has_dates": False}
+
+    titles = df["Product_Name"].astype(str).str.lower()
+    has_stock = "Available" in df and df["Available"].notna().any()
+    out["has_stock"] = bool(has_stock)
+
+    # ---- motifs: what words recur across product names ----
+    tokens = Counter()
+    for t in titles:
+        for w in set(re.findall(r"[a-z]+", t)):
+            if len(w) > 2 and w not in STOPWORDS:
+                tokens[w] += 1
+
+    for word, count in tokens.most_common(top_n):
+        if count < max(2, n * 0.01):
+            continue
+        sub = df[titles.str.contains(rf"\b{re.escape(word)}\b", regex=True)]
+        row = {
+            "term": word.title(),
+            "count": int(len(sub)),
+            "share": round(len(sub) / n * 100, 1),
+            "avg_price": round(float(sub["Price"].mean())),
+            "avg_discount": round(float(sub["Discount"].mean())),
+        }
+        if has_stock:
+            row["sold_out"] = round(float((~sub["Available"].astype(bool)).mean()) * 100, 1)
+        out["motifs"].append(row)
+
+    # ---- colour and material vocabulary ----
+    haystack = titles
+    if "Tags" in df:
+        haystack = titles + " " + df["Tags"].fillna("").astype(str).str.lower()
+
+    for label, vocab in (("colours", COLOURS), ("materials", MATERIALS)):
+        found = []
+        for term in vocab:
+            mask = haystack.str.contains(rf"\b{re.escape(term)}", regex=True)
+            hits = int(mask.sum())
+            if hits >= max(2, n * 0.005):
+                sub = df[mask]
+                entry = {"term": term.title(), "count": hits,
+                         "share": round(hits / n * 100, 1),
+                         "avg_price": round(float(sub["Price"].mean()))}
+                if has_stock:
+                    entry["sold_out"] = round(float((~sub["Available"].astype(bool)).mean()) * 100, 1)
+                found.append(entry)
+        # 'gold' would double-count 'rose gold', so drop the overlap
+        if label == "colours":
+            rose = next((f for f in found if f["term"] == "Rose Gold"), None)
+            gold = next((f for f in found if f["term"] == "Gold"), None)
+            if rose and gold:
+                gold["count"] = max(0, gold["count"] - rose["count"])
+                gold["share"] = round(gold["count"] / n * 100, 1)
+        out[label] = sorted(found, key=lambda x: -x["count"])[:top_n]
+
+    # ---- launch timeline ----
+    if "Published" in df and df["Published"].notna().any():
+        dates = pd.to_datetime(df["Published"], errors="coerce", utc=True)
+        if dates.notna().any():
+            out["has_dates"] = True
+            monthly = dates.dt.to_period("M").value_counts().sort_index().tail(12)
+            out["launches"] = [{"month": str(p), "count": int(c)}
+                               for p, c in monthly.items()]
+            recent = dates >= (dates.max() - pd.Timedelta(days=90))
+            out["recent_share"] = round(float(recent.mean()) * 100, 1)
+            if "Category" in df:
+                rc = df[recent.fillna(False)]["Category"].value_counts().head(5)
+                out["recent_categories"] = [{"name": str(k), "count": int(v)}
+                                            for k, v in rc.items()]
+    return out
+
+
+def trend_insights(df, tr):
+    """Turn the trend numbers into the same insight format as the rest."""
+    ins = []
+    add = lambda tone, icon, title, text: ins.append(
+        {"tone": tone, "icon": icon, "title": title, "text": text})
+
+    if tr["motifs"]:
+        m = tr["motifs"][0]
+        add("", "i-spark", "Dominant motif",
+            f"<em>{m['term']}</em> appears in <em>{m['count']} products</em> "
+            f"(<em>{m['share']}%</em> of the catalogue), averaging "
+            f"<em>₹{m['avg_price']:,}</em> at <em>{m['avg_discount']}%</em> off. "
+            f"It is the single most repeated theme in the range.")
+
+    if tr["has_stock"] and tr["motifs"]:
+        ranked = [m for m in tr["motifs"] if m.get("sold_out") is not None]
+        if ranked:
+            hot = max(ranked, key=lambda x: x["sold_out"])
+            cold = min(ranked, key=lambda x: x["sold_out"])
+            add("good", "i-trend", "Selling through fastest",
+                f"<em>{hot['sold_out']}%</em> of <em>{hot['term']}</em> products are out of "
+                f"stock, against <em>{cold['sold_out']}%</em> for <em>{cold['term']}</em>. "
+                f"Sell-through is a demand signal the price columns cannot show.")
+
+    if tr["colours"]:
+        c = tr["colours"][0]
+        add("", "i-pie", "Leading colour",
+            f"<em>{c['term']}</em> leads on colour with <em>{c['count']} products</em> "
+            f"(<em>{c['share']}%</em>), averaging <em>₹{c['avg_price']:,}</em>.")
+
+    if tr["materials"]:
+        mat = tr["materials"][0]
+        add("", "i-layers", "Leading material",
+            f"<em>{mat['term']}</em> is the most common material at "
+            f"<em>{mat['count']} products</em> (<em>{mat['share']}%</em>).")
+
+    if tr.get("has_dates") and tr.get("recent_share") is not None:
+        cats = tr.get("recent_categories") or []
+        lead = f" Recent launches skew towards <em>{cats[0]['name']}</em>." if cats else ""
+        add("warn" if tr["recent_share"] > 40 else "", "i-bars", "Launch velocity",
+            f"<em>{tr['recent_share']}%</em> of the catalogue was published in the last "
+            f"90 days.{lead} A high share means the range turns over fast, so any "
+            f"snapshot analysis dates quickly.")
+    return ins
+
+
+# ======================================================================
+# 5. CHARTS
+# ======================================================================
+def plot_charts(df, tr, folder="charts"):
+    """Static PNGs for slides, the report, or importing into Power BI."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("  matplotlib not installed, skipping charts")
+        return []
+
+    # Lavender only. The mint and rose from the dashboard palette are semantic
+    # (good / bad), so using them as categorical colours misreads as a signal.
+    LAV = ["#5B3FA8", "#8B5FD6", "#B07BE8", "#6E7FE0", "#C98FD9",
+           "#3F2B78", "#9A8AF0", "#D9A8E6", "#8E6FC4", "#7C63D6"]
+    INK, GRID, PAPER = "#2E2350", "#E6DCF8", "#F6F1FD"
+
+    d = folder if isinstance(folder, Path) else OUT / folder
+    d.mkdir(exist_ok=True)
+    made = []
+
+    def style(ax, title):
+        ax.set_title(title, color=INK, fontsize=13, weight="bold", pad=14, loc="left")
+        ax.set_facecolor(PAPER)
+        ax.tick_params(colors=INK, labelsize=9)
+        for s in ("top", "right"):
+            ax.spines[s].set_visible(False)
+        for s in ("left", "bottom"):
+            ax.spines[s].set_color(GRID)
+        ax.grid(axis="x", color=GRID, lw=1)
+        ax.set_axisbelow(True)
+
+    def save(fig, name):
+        path = d / name
+        fig.patch.set_facecolor(PAPER)
+        fig.tight_layout()
+        fig.savefig(path, dpi=150, facecolor=PAPER)
+        plt.close(fig)
+        made.append(path)
+
+    # price distribution
+    fig, ax = plt.subplots(figsize=(8, 4.2))
+    ax.hist(df["Price"], bins=min(30, max(6, len(df) // 8)),
+            color=LAV[1], edgecolor=PAPER)
+    ax.axvline(df["Price"].median(), color=LAV[0], ls="--", lw=2,
+               label=f"median ₹{df['Price'].median():,.0f}")
+    ax.legend(frameon=False, labelcolor=INK, fontsize=9)
+    style(ax, "Price distribution")
+    ax.grid(axis="x", visible=False)
+    ax.grid(axis="y", color=GRID, lw=1)
+    save(fig, "01_price_distribution.png")
+
+    # categories
+    cats = df[df["Category"] != "Uncategorised"]["Category"].value_counts().head(10)
+    if len(cats) > 1:
+        fig, ax = plt.subplots(figsize=(8, 4.2))
+        ax.barh(cats.index[::-1], cats.values[::-1],
+                color=[LAV[i % len(LAV)] for i in range(len(cats))])
+        style(ax, "Products by category")
+        save(fig, "02_categories.png")
+
+        avg = df[df["Category"] != "Uncategorised"].groupby("Category")["Discount"].mean()
+        avg = avg.sort_values().tail(10)
+        fig, ax = plt.subplots(figsize=(8, 4.2))
+        ax.barh(avg.index, avg.values, color=LAV[2])
+        ax.set_xlabel("average discount %", color=INK, fontsize=9)
+        style(ax, "Discount depth by category")
+        save(fig, "03_discount_by_category.png")
+
+    # motifs
+    if tr["motifs"]:
+        m = tr["motifs"][:10][::-1]
+        fig, ax = plt.subplots(figsize=(8, 4.2))
+        ax.barh([x["term"] for x in m], [x["count"] for x in m],
+                color=[LAV[i % len(LAV)] for i in range(len(m))])
+        ax.set_xlabel("products containing the term", color=INK, fontsize=9)
+        style(ax, "Recurring motifs in product names")
+        save(fig, "04_motifs.png")
+
+    # price vs original
+    fig, ax = plt.subplots(figsize=(6.5, 6))
+    ax.scatter(df["Old_Price"], df["Price"], s=26, alpha=.65, color=LAV[0],
+               edgecolors="none")
+    lim = float(df["Old_Price"].max()) * 1.05
+    ax.plot([0, lim], [0, lim], color=LAV[3], ls="--", lw=1.2, label="no discount")
+    ax.plot([0, lim], [0, lim / 2], color=LAV[4], ls=":", lw=1.2, label="50% off")
+    ax.set_xlabel("original price", color=INK, fontsize=9)
+    ax.set_ylabel("selling price", color=INK, fontsize=9)
+    ax.legend(frameon=False, labelcolor=INK, fontsize=9)
+    style(ax, "Selling price against original price")
+    ax.grid(color=GRID, lw=1)
+    save(fig, "05_price_vs_original.png")
+
+    # launches
+    if tr.get("launches"):
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.plot([l["month"] for l in tr["launches"]],
+                [l["count"] for l in tr["launches"]],
+                color=LAV[0], lw=2.5, marker="o", ms=5)
+        ax.tick_params(axis="x", rotation=45)
+        ax.set_ylabel("products published", color=INK, fontsize=9)
+        style(ax, "Launch volume by month")
+        ax.grid(axis="y", color=GRID, lw=1)
+        ax.grid(axis="x", visible=False)
+        save(fig, "06_launch_timeline.png")
+
+    return made
+
+
+# ======================================================================
+# 6. BUILD DASHBOARD
+# ======================================================================
+def build_dashboard(df, kpis, insights, source, trends=None):
+    cols = ["Product_Name", "Price", "Old_Price", "Discount", "Savings", "Category"]
+    if "Sentiment" in df:
+        cols.append("Sentiment")
+
+    rows = df[cols].rename(columns={
+        "Product_Name": "n", "Price": "p", "Old_Price": "o",
+        "Discount": "d", "Savings": "s", "Category": "c", "Sentiment": "sent",
+    })
+    rows["p"] = rows["p"].round(0).astype(int)
+    rows["o"] = rows["o"].round(0).astype(int)
+    rows["s"] = rows["s"].round(0).astype(int)
+
+    payload = json.dumps({
+        "rows": rows.to_dict("records"),
+        "kpis": kpis,
+        "insights": insights,
+        "trends": trends or {},
+        "source": source,
+    }, ensure_ascii=False, separators=(",", ":"))
+
+    html = TEMPLATE.replace("/*__PAYLOAD__*/null", payload)
+    path = OUT / "fashion_analytics_dashboard.html"
+    path.write_text(html, encoding="utf-8")
+    return path
+
+
+TEMPLATE = r"""<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Fashion Analytics Dashboard · Salty</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Outfit:wght@300;400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{--void:#150F26;--canvas:#1E1733;--panel:#2A2148;--band:#3E2F6B;--line:#4A3A7A;
+--l50:#F6F1FD;--l100:#E4D6F9;--l200:#D3C0F3;--l300:#C9B4EE;--l400:#B07BE8;--l500:#8B5FD6;
+--l600:#5B3FA8;--l700:#4A3282;--l800:#32215E;--l900:#2E2350;
+--ink:#F3ECFD;--dim:#C9B4EE;--faint:#8E7EB8;--mint:#4E9E8C;--rose:#D45F86;--amber:#C99B4E;
+--r:14px;--gap:16px}
+*{box-sizing:border-box;margin:0;padding:0}
+html{background:var(--void)}
+body{font-family:'Outfit',-apple-system,'Segoe UI',sans-serif;background:var(--canvas);
+color:var(--ink);font-weight:300;-webkit-font-smoothing:antialiased;
+font-variant-numeric:tabular-nums;padding:24px;max-width:1360px;margin:0 auto}
+.icon{width:1em;height:1em;stroke:currentColor;fill:none;stroke-width:1.6;
+stroke-linecap:round;stroke-linejoin:round;flex:none}
+.band{background:var(--band);border-radius:var(--r);padding:22px 28px;display:flex;
+align-items:flex-end;justify-content:space-between;gap:24px;flex-wrap:wrap;border:1px solid var(--line)}
+.band h1{font-family:'Instrument Serif',Georgia,serif;font-weight:400;font-size:38px;line-height:1}
+.band h1 em{font-style:italic;color:var(--l400)}
+.band p{color:var(--dim);font-size:14px;margin-top:8px}
+.source{display:flex;align-items:center;gap:8px;background:rgba(176,123,232,.16);
+border:1px solid var(--l500);color:var(--l300);padding:8px 14px;border-radius:999px;font-size:13px}
+.source .icon{width:15px;height:15px}
+.controls{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:22px 0 18px}
+.controls .lbl{display:flex;align-items:center;gap:7px;color:var(--faint);font-size:12px;
+text-transform:uppercase;letter-spacing:1.4px}
+.chip{font-family:inherit;font-size:13px;background:transparent;color:var(--dim);
+border:1px solid var(--line);border-radius:999px;padding:7px 15px;cursor:pointer;transition:.16s}
+.chip:hover{border-color:var(--l500);color:var(--ink)}
+.chip[aria-pressed=true]{background:var(--l600);border-color:var(--l400);color:#fff;font-weight:500}
+.chip:focus-visible,select:focus-visible,.search:focus-visible{outline:2px solid var(--l400);outline-offset:2px}
+.sep{width:1px;height:22px;background:var(--line);margin:0 4px}
+select,.search{font-family:inherit;font-size:13px;background:var(--panel);color:var(--ink);
+border:1px solid var(--line);border-radius:999px;padding:7px 14px;cursor:pointer}
+.search{cursor:text;min-width:180px}
+.kpis{display:grid;grid-template-columns:repeat(5,1fr);gap:var(--gap)}
+.kpi{border-radius:var(--r);padding:16px 18px 18px;display:flex;flex-direction:column;
+gap:10px;color:var(--l800);min-height:118px}
+.kpi:nth-child(1){background:var(--l100)}.kpi:nth-child(2){background:var(--l200)}
+.kpi:nth-child(3){background:var(--l300)}.kpi:nth-child(4){background:var(--l200)}
+.kpi:nth-child(5){background:var(--l100)}
+.kpi .top{display:flex;align-items:center;justify-content:space-between}
+.kpi .name{font-size:12px;letter-spacing:1.3px;text-transform:uppercase;color:var(--l700);font-weight:500}
+.kpi .top .icon{width:19px;height:19px;color:var(--l600);opacity:.85}
+.kpi .val{font-size:32px;font-weight:300;line-height:1;letter-spacing:-.5px}
+.kpi .sub{font-size:12px;color:var(--l700);opacity:.8;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.grid{display:grid;gap:var(--gap);margin-top:var(--gap)}
+.split{grid-template-columns:1.62fr 1fr}
+.panel{background:var(--l50);border-radius:var(--r);padding:18px 20px 20px;
+color:var(--l900);border:1px solid var(--l200)}
+.panel>header{display:flex;align-items:center;gap:9px;margin-bottom:4px}
+.panel>header .icon{width:17px;height:17px;color:var(--l600)}
+.panel h2{font-size:15px;font-weight:600}
+.panel .note{font-size:12px;color:#7A6B9E;margin-bottom:16px}
+.panel .spacer{margin-left:auto;font-size:12px;color:#7A6B9E}
+.insights{background:var(--panel);border:1px solid var(--line);color:var(--ink)}
+.insights h2,.insights .spacer{color:var(--ink)}
+.insights>header .icon{color:var(--l400)}
+.insights .note{color:var(--faint)}
+.ins-list{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}
+.ins{display:flex;gap:13px;padding:14px 16px;border-radius:11px;background:rgba(246,241,253,.05);
+border:1px solid var(--line);border-left:3px solid var(--l400)}
+.ins.flag{border-left-color:var(--rose)}.ins.good{border-left-color:var(--mint)}
+.ins.warn{border-left-color:var(--amber)}
+.ins .icon{width:18px;height:18px;color:var(--l400);margin-top:2px}
+.ins.flag .icon{color:var(--rose)}.ins.good .icon{color:var(--mint)}.ins.warn .icon{color:var(--amber)}
+.ins b{display:block;font-size:13px;font-weight:500;margin-bottom:4px}
+.ins p{font-size:12.5px;line-height:1.5;color:var(--dim)}
+.ins em{font-style:normal;color:var(--l300)}
+.dumb{display:flex;flex-direction:column;gap:13px}
+.row{display:grid;grid-template-columns:210px 1fr 74px;align-items:center;gap:14px}
+.row .nm{font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.track{position:relative;height:16px}
+.track .bar{position:absolute;top:7px;height:3px;border-radius:2px;
+background:linear-gradient(90deg,var(--l600),var(--l300))}
+.dot{position:absolute;top:2px;width:13px;height:13px;border-radius:50%;transform:translateX(-6.5px)}
+.dot.now{background:var(--l600);border:2px solid var(--l50)}
+.dot.was{background:var(--l50);border:2px solid var(--l300)}
+.row .off{font-size:12px;text-align:right;color:var(--l700);font-weight:500}
+.legend{display:flex;gap:18px;font-size:12px;color:#7A6B9E;margin-bottom:14px}
+.legend span{display:flex;align-items:center;gap:6px}
+.swatch{width:11px;height:11px;border-radius:50%}
+.donut-wrap{display:flex;align-items:center;gap:20px;flex-wrap:wrap}
+.donut{position:relative;flex:none}
+.donut .mid{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center}
+.donut .mid b{font-size:26px;font-weight:400;color:var(--l800);line-height:1}
+.donut .mid small{font-size:11px;color:#7A6B9E;letter-spacing:.6px}
+.keys{display:flex;flex-direction:column;gap:8px;font-size:12.5px;flex:1;min-width:150px;
+max-height:190px;overflow:auto}
+.keys div{display:flex;align-items:center;gap:9px}
+.keys .swatch{border-radius:3px}
+.keys b{margin-left:auto;font-weight:500;color:var(--l700)}
+#tree{position:relative;width:100%;height:250px}
+.tile{position:absolute;border-radius:7px;overflow:hidden;padding:9px 11px;color:#fff;
+transition:.16s;border:2px solid var(--l50)}
+.tile b{display:block;font-size:12px;font-weight:500;line-height:1.28}
+.tile span{font-size:11px;opacity:.85;font-weight:300}
+.tile:hover{filter:brightness(1.12)}
+table{width:100%;border-collapse:collapse;font-size:13px}
+thead th{background:var(--l700);color:var(--l50);font-weight:500;font-size:11px;
+letter-spacing:1.1px;text-transform:uppercase;padding:10px 12px;text-align:left;cursor:pointer}
+thead th:first-child{border-radius:7px 0 0 7px}thead th:last-child{border-radius:0 7px 7px 0}
+thead th.num,tbody td.num{text-align:right}
+tbody td{padding:10px 12px;border-bottom:1px solid #E4DBF6}
+tbody tr:nth-child(even){background:#EFE8FB}
+.pill{display:inline-block;padding:2px 9px;border-radius:999px;font-size:11px;font-weight:500}
+.strike{color:#9587B5;text-decoration:line-through;font-weight:300}
+.pager{display:flex;align-items:center;gap:10px;margin-top:14px;font-size:12.5px;color:#7A6B9E}
+.pager button{font-family:inherit;font-size:12.5px;background:var(--l100);color:var(--l800);
+border:1px solid var(--l300);border-radius:8px;padding:5px 12px;cursor:pointer}
+.pager button:disabled{opacity:.4;cursor:default}
+.pager .grow{margin-left:auto}
+.empty{padding:34px;text-align:center;color:#7A6B9E;font-size:13.5px}
+footer{margin-top:22px;padding-top:16px;border-top:1px solid var(--line);display:flex;
+justify-content:space-between;gap:16px;flex-wrap:wrap;font-size:12px;color:var(--faint)}
+footer .icon{width:13px;height:13px;vertical-align:-2px;margin-right:5px}
+@media(max-width:1080px){.kpis{grid-template-columns:repeat(2,1fr)}.split{grid-template-columns:1fr}
+.ins-list{grid-template-columns:1fr}.row{grid-template-columns:150px 1fr 62px}}
+@media(max-width:600px){body{padding:14px}.band h1{font-size:28px}.kpis{grid-template-columns:1fr}
+.row{grid-template-columns:1fr;gap:5px}.row .off{text-align:left}}
+@media(prefers-reduced-motion:reduce){*{transition:none!important}}
+</style></head><body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+<g id="i-tag"><path d="M20.6 13.4 13.4 20.6a2 2 0 0 1-2.8 0l-7.2-7.2A2 2 0 0 1 3 12V4a1 1 0 0 1 1-1h8a2 2 0 0 1 1.4.6l7.2 7.2a2 2 0 0 1 0 2.6Z"/><circle cx="7.5" cy="7.5" r="1.2"/></g>
+<g id="i-box"><path d="M21 8 12 3 3 8v8l9 5 9-5Z"/><path d="M3 8l9 5 9-5M12 13v8"/></g>
+<g id="i-scales"><path d="M12 3v18M7 7l-4 7h8ZM17 7l-4 7h8ZM7 21h10"/></g>
+<g id="i-peak"><path d="M3 18 9 9l4 5 3-4 5 8Z"/></g>
+<g id="i-floor"><path d="M3 6l6 9 4-5 3 4 5-8"/><path d="M3 20h18"/></g>
+<g id="i-coins"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v6c0 1.7 3.6 3 8 3s8-1.3 8-3V6"/><path d="M4 12v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></g>
+<g id="i-filter"><path d="M4 5h16l-6.5 7.5V19l-3 2v-8.5Z"/></g>
+<g id="i-bars"><path d="M4 20h16M7 20V9M12 20V4M17 20v-7"/></g>
+<g id="i-pie"><path d="M12 3a9 9 0 1 0 9 9h-9Z"/><path d="M15 3.6A9 9 0 0 1 20.4 9H15Z"/></g>
+<g id="i-grid"><rect x="3" y="3" width="8" height="10" rx="1"/><rect x="13" y="3" width="8" height="6" rx="1"/><rect x="13" y="11" width="8" height="10" rx="1"/><rect x="3" y="15" width="8" height="6" rx="1"/></g>
+<g id="i-list"><path d="M8 6h13M8 12h13M8 18h13M3.5 6h.01M3.5 12h.01M3.5 18h.01"/></g>
+<g id="i-db"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/></g>
+<g id="i-spark"><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1"/><circle cx="12" cy="12" r="3"/></g>
+<g id="i-alert"><path d="M12 9v4M12 17h.01"/><path d="M10.3 3.9 2.7 17a2 2 0 0 0 1.7 3h15.2a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/></g>
+<g id="i-trend"><path d="M3 17l6-6 4 4 8-8"/><path d="M15 7h6v6"/></g>
+<g id="i-target"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1.4"/></g>
+<g id="i-layers"><path d="M12 3 2 8l10 5 10-5Z"/><path d="M2 13l10 5 10-5"/></g>
+</defs></svg>
+
+<div class="band">
+  <div><h1>Fashion <em>Analytics</em></h1>
+  <p>Catalogue pricing, discount depth and savings across the Salty range</p></div>
+  <span class="source"><svg class="icon"><use href="#i-db"/></svg><span id="srcLabel"></span></span>
+</div>
+
+<div class="controls" role="group" aria-label="Filters">
+  <span class="lbl"><svg class="icon" style="width:14px;height:14px"><use href="#i-filter"/></svg>Discount</span>
+  <button class="chip" data-band="all" aria-pressed="true">All</button>
+  <button class="chip" data-band="none" aria-pressed="false">No discount</button>
+  <button class="chip" data-band="low" aria-pressed="false">Under 30%</button>
+  <button class="chip" data-band="mid" aria-pressed="false">30–49%</button>
+  <button class="chip" data-band="half" aria-pressed="false">Exactly 50%</button>
+  <button class="chip" data-band="deep" aria-pressed="false">Over 50%</button>
+  <span class="sep"></span>
+  <select id="catSel" aria-label="Category"></select>
+  <select id="topSel" aria-label="Chart size">
+    <option value="10">Chart top 10</option><option value="20" selected>Chart top 20</option>
+    <option value="50">Chart top 50</option><option value="0">Chart all</option>
+  </select>
+  <input class="search" id="search" type="search" placeholder="Search products…" aria-label="Search">
+</div>
+
+<section class="kpis" id="kpis"></section>
+
+<div class="grid"><div class="panel insights">
+  <header><svg class="icon"><use href="#i-spark"/></svg><h2>Analysis</h2>
+  <span class="spacer" id="insCount"></span></header>
+  <p class="note">Computed in salty_analytics.py across the full catalogue, before any filter is applied.</p>
+  <div class="ins-list" id="insights"></div>
+</div></div>
+
+<div class="grid split">
+  <div class="panel"><header><svg class="icon"><use href="#i-bars"/></svg>
+    <h2>How far each price has fallen</h2><span class="spacer" id="dumbCount"></span></header>
+    <p class="note">Each product from its original price down to what it sells for, ranked by current price.</p>
+    <div class="legend">
+      <span><i class="swatch" style="background:#F6F1FD;border:2px solid #C9B4EE"></i>Original price</span>
+      <span><i class="swatch" style="background:#5B3FA8"></i>Selling price</span></div>
+    <div class="dumb" id="dumb" style="max-height:520px;overflow:auto"></div></div>
+  <div class="panel"><header><svg class="icon"><use href="#i-pie"/></svg>
+    <h2>Discount distribution</h2></header>
+    <p class="note" id="donutNote"></p>
+    <div class="donut-wrap"><div class="donut" id="donut"></div><div class="keys" id="donutKeys"></div></div></div>
+</div>
+
+<div class="grid split">
+  <div class="panel"><header><svg class="icon"><use href="#i-grid"/></svg>
+    <h2>Where the savings sit</h2></header>
+    <p class="note">Tile size is total rupees saved on that product.</p><div id="tree"></div></div>
+  <div class="panel"><header><svg class="icon"><use href="#i-scales"/></svg>
+    <h2 id="bandsTitle">Price bands</h2></header>
+    <p class="note" id="bandsNote"></p><div class="dumb" id="bands"></div></div>
+</div>
+
+<div class="grid split" id="trendWrap" style="display:none">
+  <div class="panel"><header><svg class="icon"><use href="#i-spark"/></svg>
+    <h2>Recurring motifs</h2><span class="spacer" id="motifNote"></span></header>
+    <p class="note">Words that repeat across product names, with what they cost and how deeply they discount.</p>
+    <div class="dumb" id="motifs"></div></div>
+  <div class="panel"><header><svg class="icon"><use href="#i-layers"/></svg>
+    <h2 id="paletteTitle">Colour and material</h2></header>
+    <p class="note">Vocabulary matched against titles and tags.</p>
+    <div class="dumb" id="palette"></div></div>
+</div>
+
+<div class="grid" id="launchWrap" style="display:none"><div class="panel">
+  <header><svg class="icon"><use href="#i-bars"/></svg><h2>Launch volume by month</h2>
+  <span class="spacer" id="launchNote"></span></header>
+  <p class="note">How many products were published each month — what the brand is betting on now.</p>
+  <div id="launch"></div>
+</div></div>
+
+<div class="grid"><div class="panel">
+  <header><svg class="icon"><use href="#i-list"/></svg><h2>Product catalogue</h2>
+  <span class="spacer" id="tblCount"></span></header>
+  <p class="note">Click a column heading to sort.</p>
+  <div id="tableWrap"></div><div class="pager" id="pager"></div>
+</div></div>
+
+<footer><span><svg class="icon"><use href="#i-db"/></svg><span id="footSrc"></span></span>
+<span>Generated by salty_analytics.py</span></footer>
+
+<script>
+const PAYLOAD = /*__PAYLOAD__*/null;
+const DATA = PAYLOAD.rows, KPI = PAYLOAD.kpis, INSIGHTS = PAYLOAD.insights;
+const RAMP=["#5B3FA8","#8B5FD6","#B07BE8","#6E7FE0","#C98FD9","#3F2B78","#9A8AF0",
+            "#D9A8E6","#4E9E8C","#8E6FC4","#C99B4E","#D45F86"];
+let band="all",cat="all",topN=20,query="",sortKey="p",sortDir=-1,page=0;
+const PER=25;
+const rupee=v=>"₹"+Math.round(v).toLocaleString("en-IN");
+const num=v=>Math.round(v).toLocaleString("en-IN");
+const el=(t,c)=>{const e=document.createElement(t);if(c)e.className=c;return e};
+const esc=t=>String(t).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const median=a=>{const s=[...a].sort((x,y)=>x-y),m=s.length>>1;
+  return s.length%2?s[m]:(s[m-1]+s[m])/2};
+
+const BANDS={all:()=>true,none:r=>r.d===0,low:r=>r.d>0&&r.d<30,
+  mid:r=>r.d>=30&&r.d<50,half:r=>r.d===50,deep:r=>r.d>50};
+const view=()=>{const q=query.trim().toLowerCase();
+  return DATA.filter(r=>BANDS[band](r)&&(cat==="all"||r.c===cat)&&
+    (!q||r.n.toLowerCase().includes(q)))};
+const charted=(rows,k)=>{const s=[...rows].sort((a,b)=>b[k]-a[k]);return topN?s.slice(0,topN):s};
+
+function renderInsights(){
+  const box=document.getElementById("insights");
+  document.getElementById("insCount").textContent=INSIGHTS.length+" findings";
+  box.innerHTML="";
+  INSIGHTS.forEach(i=>{const d=el("div","ins "+(i.tone||""));
+    d.innerHTML=`<svg class="icon"><use href="#${i.icon}"/></svg>
+      <div><b>${i.title}</b><p>${i.text}</p></div>`;box.appendChild(d)});
+}
+
+function renderKpis(rows){
+  const box=document.getElementById("kpis");box.innerHTML="";
+  if(!rows.length){box.innerHTML='<p class="empty" style="grid-column:1/-1">No products match these filters.</p>';return}
+  const P=rows.map(r=>r.p),short=t=>t.length>28?t.slice(0,27)+"…":t;
+  const hi=rows.reduce((a,b)=>b.p>a.p?b:a),lo=rows.reduce((a,b)=>b.p<a.p?b:a);
+  [["Total products","i-box",num(rows.length),`of ${num(KPI.products)} in catalogue`],
+   ["Average price","i-tag",rupee(P.reduce((a,b)=>a+b,0)/rows.length),`median ${rupee(median(P))}`],
+   ["Highest price","i-peak",rupee(hi.p),short(hi.n)],
+   ["Lowest price","i-floor",rupee(lo.p),short(lo.n)],
+   ["Total savings","i-coins",rupee(rows.reduce((a,b)=>a+b.s,0)),"original minus selling"]
+  ].forEach(([n,ic,v,s])=>{const c=el("div","kpi");
+    c.innerHTML=`<div class="top"><span class="name">${n}</span>
+      <svg class="icon"><use href="#${ic}"/></svg></div>
+      <div class="val">${v}</div><div class="sub">${esc(s)}</div>`;box.appendChild(c)});
+}
+
+function renderDumb(rows){
+  const box=document.getElementById("dumb");box.innerHTML="";
+  const cnt=document.getElementById("dumbCount");
+  if(!rows.length){cnt.textContent="";box.innerHTML='<p class="empty">Nothing to plot.</p>';return}
+  const top=charted(rows,"p");cnt.textContent=`showing ${top.length} of ${num(rows.length)}`;
+  const max=Math.max(...top.map(r=>r.o))||1,frag=document.createDocumentFragment();
+  top.forEach(r=>{const row=el("div","row"),now=r.p/max*100,was=r.o/max*100;
+    row.innerHTML=`<span class="nm" title="${esc(r.n)}">${esc(r.n)}</span>
+      <span class="track"><span class="bar" style="left:${now}%;width:${Math.max(0,was-now)}%"></span>
+      <span class="dot was" style="left:${was}%" title="Was ${rupee(r.o)}"></span>
+      <span class="dot now" style="left:${now}%" title="Now ${rupee(r.p)}"></span></span>
+      <span class="off">${rupee(r.p)}</span>`;frag.appendChild(row)});
+  box.appendChild(frag);
+}
+
+function renderDonut(rows){
+  const host=document.getElementById("donut"),keys=document.getElementById("donutKeys");
+  const note=document.getElementById("donutNote");
+  host.innerHTML="";keys.innerHTML="";
+  if(!rows.length){keys.innerHTML='<p class="empty">No data.</p>';return}
+  const distinct=new Set(rows.map(r=>r.d));let items;
+  if(distinct.size>8){
+    const defs=[["No discount",r=>r.d===0],["Under 20%",r=>r.d>0&&r.d<20],["20–29%",r=>r.d>=20&&r.d<30],
+      ["30–39%",r=>r.d>=30&&r.d<40],["40–49%",r=>r.d>=40&&r.d<50],["Exactly 50%",r=>r.d===50],
+      ["51–69%",r=>r.d>50&&r.d<70],["70% and over",r=>r.d>=70]];
+    items=defs.map(([l,f])=>({label:l,c:rows.filter(f).length})).filter(i=>i.c);
+    note.textContent=`Grouped into bands — ${distinct.size} distinct discount values present.`;
+  }else{
+    const t={};rows.forEach(r=>t[r.d]=(t[r.d]||0)+1);
+    items=Object.entries(t).map(([d,c])=>({label:d+"% off",c,d:+d}))
+      .sort((a,b)=>b.c-a.c||b.d-a.d);
+    note.textContent="Products grouped by the discount on the listing.";
+  }
+  const R=62,TH=20,C=2*Math.PI*R,S=160;let off=0;
+  const svg=[`<svg width="${S}" height="${S}" viewBox="0 0 ${S} ${S}" role="img" aria-label="Discount distribution">`];
+  items.forEach((it,i)=>{const f=it.c/rows.length;
+    svg.push(`<circle cx="${S/2}" cy="${S/2}" r="${R}" fill="none" stroke="${RAMP[i%RAMP.length]}"
+      stroke-width="${TH}" stroke-dasharray="${(f*C).toFixed(2)} ${C.toFixed(2)}"
+      stroke-dashoffset="${(-off*C).toFixed(2)}" transform="rotate(-90 ${S/2} ${S/2})">
+      <title>${esc(it.label)} — ${it.c} products</title></circle>`);
+    off+=f;const k=el("div");
+    k.innerHTML=`<i class="swatch" style="background:${RAMP[i%RAMP.length]}"></i>
+      ${esc(it.label)} <b>${it.c} · ${Math.round(f*100)}%</b>`;keys.appendChild(k)});
+  svg.push("</svg>");
+  host.innerHTML=svg.join("")+`<div class="mid"><b>${num(rows.length)}</b><small>PRODUCTS</small></div>`;
+  host.style.width=S+"px";host.style.height=S+"px";
+}
+
+function squarify(items,x,y,w,h,out){
+  if(!items.length)return out;
+  if(items.length===1){out.push({...items[0],x,y,w,h});return out}
+  const total=items.reduce((a,b)=>a+b.v,0);let split=0,acc=0;
+  for(let i=0;i<items.length;i++){acc+=items[i].v;split=i+1;if(acc>=total/2)break}
+  const f=acc/total;
+  if(w>=h){squarify(items.slice(0,split),x,y,w*f,h,out);
+           squarify(items.slice(split),x+w*f,y,w*(1-f),h,out)}
+  else{squarify(items.slice(0,split),x,y,w,h*f,out);
+       squarify(items.slice(split),x,y+h*f,w,h*(1-f),out)}
+  return out;
+}
+
+function renderTree(rows){
+  const host=document.getElementById("tree");host.innerHTML="";
+  const withSave=rows.filter(r=>r.s>0);
+  if(!withSave.length){host.innerHTML='<p class="empty">No savings to map in this selection.</p>';return}
+  const cap=topN?Math.min(topN,24):24;
+  const top=[...withSave].sort((a,b)=>b.s-a.s).slice(0,cap).map(r=>({...r,v:r.s}));
+  const W=host.clientWidth||620,frag=document.createDocumentFragment();
+  squarify(top,0,0,W,250,[]).forEach((t,i)=>{const d=el("div","tile");
+    d.style.cssText=`left:${t.x}px;top:${t.y}px;width:${t.w}px;height:${t.h}px;background:${RAMP[i%RAMP.length]}`;
+    d.title=`${t.n} — ${rupee(t.s)} saved`;
+    if(t.w>74&&t.h>40)d.innerHTML=`<b>${esc(t.n.length>26?t.n.slice(0,25)+"…":t.n)}</b><span>${rupee(t.s)}</span>`;
+    else if(t.w>46&&t.h>22)d.innerHTML=`<span>${rupee(t.s)}</span>`;
+    frag.appendChild(d)});
+  host.appendChild(frag);
+}
+
+function renderBands(rows){
+  const box=document.getElementById("bands"),title=document.getElementById("bandsTitle");
+  const note=document.getElementById("bandsNote");box.innerHTML="";
+  if(!rows.length){box.innerHTML='<p class="empty">Nothing to bucket.</p>';return}
+  const cats=[...new Set(rows.map(r=>r.c).filter(c=>c&&c!=="Uncategorised"))];
+  let counts;
+  if(cats.length>1){
+    title.textContent="Products by category";note.textContent="Count of products in each category.";
+    const t={};rows.forEach(r=>{if(r.c)t[r.c]=(t[r.c]||0)+1});
+    counts=Object.entries(t).sort((a,b)=>b[1]-a[1]).slice(0,10).map(([l,c])=>({l,c}));
+  }else{
+    title.textContent="Price bands";note.textContent="Count of products in each selling-price bracket.";
+    const max=Math.max(...rows.map(r=>r.p)),step=Math.max(1,Math.ceil(max/5/100)*100);counts=[];
+    for(let i=0;i<5;i++){const lo=i*step,hi=(i+1)*step;
+      counts.push({l:i===4?`${rupee(lo)} and above`:`${rupee(lo)} – ${rupee(hi-1)}`,
+        c:rows.filter(r=>i===4?r.p>=lo:r.p>=lo&&r.p<hi).length})}
+  }
+  const max=Math.max(...counts.map(c=>c.c),1);
+  counts.forEach((b,i)=>{const row=el("div","row");
+    row.style.gridTemplateColumns="148px 1fr 34px";
+    row.innerHTML=`<span class="nm" title="${esc(b.l)}">${esc(b.l)}</span>
+      <span class="track"><span class="bar" style="left:0;width:${b.c/max*100}%;height:11px;
+        top:3px;border-radius:5px;background:${RAMP[i%RAMP.length]}"></span></span>
+      <span class="off">${b.c}</span>`;box.appendChild(row)});
+}
+
+function renderTable(rows){
+  const wrap=document.getElementById("tableWrap"),pager=document.getElementById("pager");
+  const cnt=document.getElementById("tblCount");
+  if(!rows.length){wrap.innerHTML='<p class="empty">No products match these filters.</p>';
+    pager.innerHTML="";cnt.textContent="";return}
+  const hasCat=rows.some(r=>r.c&&r.c!=="Uncategorised");
+  const cols=[["n","Product",0]].concat(hasCat?[["c","Category",0]]:[],
+    [["o","Original",1],["p","Selling price",1],["d","Discount",1],["s","Saved",1]]);
+  const sorted=[...rows].sort((a,b)=>{const A=a[sortKey]??"",B=b[sortKey]??"";
+    return (typeof A==="string"?String(A).localeCompare(String(B)):A-B)*sortDir});
+  const pages=Math.ceil(sorted.length/PER);page=Math.max(0,Math.min(page,pages-1));
+  const slice=sorted.slice(page*PER,page*PER+PER);
+  cnt.textContent=`${num(sorted.length)} rows`;
+  const head=cols.map(([k,l,isN])=>`<th class="${isN?"num":""}" data-k="${k}" tabindex="0" role="button">
+    ${l}${sortKey===k?(sortDir<0?" ↓":" ↑"):""}</th>`).join("");
+  const body=slice.map(r=>{const heat=r.d>=50?"#5B3FA8":r.d>=30?"#8B5FD6":r.d>0?"#C98FD9":"#B9AECF";
+    return `<tr><td>${esc(r.n)}</td>${hasCat?`<td>${esc(r.c||"—")}</td>`:""}
+      <td class="num strike">${rupee(r.o)}</td>
+      <td class="num" style="font-weight:500">${rupee(r.p)}</td>
+      <td class="num"><span class="pill" style="background:${heat};color:#fff">${r.d}%</span></td>
+      <td class="num" style="color:#4E9E8C;font-weight:500">${rupee(r.s)}</td></tr>`}).join("");
+  wrap.innerHTML=`<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+  wrap.querySelectorAll("th").forEach(th=>{
+    const go=()=>{const k=th.dataset.k;
+      if(sortKey===k)sortDir*=-1;else{sortKey=k;sortDir=(k==="n"||k==="c")?1:-1}
+      page=0;renderTable(view())};
+    th.addEventListener("click",go);
+    th.addEventListener("keydown",e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();go()}})});
+  pager.innerHTML=pages>1
+    ?`<button id="prev" ${page===0?"disabled":""}>Previous</button>
+      <span>Page ${page+1} of ${pages}</span>
+      <button id="next" ${page>=pages-1?"disabled":""}>Next</button>
+      <span class="grow">Showing ${num(page*PER+1)}–${num(Math.min((page+1)*PER,sorted.length))}</span>`
+    :`<span class="grow">All ${num(sorted.length)} rows shown</span>`;
+  const p=document.getElementById("prev"),nx=document.getElementById("next");
+  if(p)p.onclick=()=>{page--;renderTable(view())};
+  if(nx)nx.onclick=()=>{page++;renderTable(view())};
+}
+
+function renderTrends(){
+  const T=PAYLOAD.trends||{};
+  const motifs=T.motifs||[],cols=(T.colours||[]).concat(T.materials||[]);
+  if(motifs.length||cols.length){
+    document.getElementById("trendWrap").style.display="";
+    const mBox=document.getElementById("motifs");
+    if(motifs.length){
+      document.getElementById("motifNote").textContent=motifs.length+" terms";
+      const max=Math.max(...motifs.map(m=>m.count));
+      motifs.forEach((m,i)=>{
+        const extra=m.sold_out!==undefined?` · ${m.sold_out}% sold out`:"";
+        const row=el("div","row");
+        row.style.gridTemplateColumns="110px 1fr 128px";
+        row.innerHTML=`<span class="nm" title="${esc(m.term)}">${esc(m.term)}</span>
+          <span class="track"><span class="bar" style="left:0;width:${m.count/max*100}%;
+            height:11px;top:3px;border-radius:5px;background:${RAMP[i%RAMP.length]}"></span></span>
+          <span class="off">${m.count} · ${rupee(m.avg_price)}${extra}</span>`;
+        mBox.appendChild(row)});
+    } else mBox.innerHTML='<p class="empty">No repeating terms found.</p>';
+
+    const pBox=document.getElementById("palette");
+    if(cols.length){
+      const max=Math.max(...cols.map(c=>c.count));
+      cols.sort((a,b)=>b.count-a.count).slice(0,12).forEach((c,i)=>{
+        const row=el("div","row");
+        row.style.gridTemplateColumns="120px 1fr 96px";
+        row.innerHTML=`<span class="nm" title="${esc(c.term)}">${esc(c.term)}</span>
+          <span class="track"><span class="bar" style="left:0;width:${c.count/max*100}%;
+            height:11px;top:3px;border-radius:5px;background:${RAMP[i%RAMP.length]}"></span></span>
+          <span class="off">${c.count} · ${rupee(c.avg_price)}</span>`;
+        pBox.appendChild(row)});
+    } else pBox.innerHTML='<p class="empty">No colour or material terms matched.</p>';
+  }
+
+  const L=T.launches||[];
+  if(L.length>1){
+    document.getElementById("launchWrap").style.display="";
+    if(T.recent_share!==undefined)
+      document.getElementById("launchNote").textContent=T.recent_share+"% published in the last 90 days";
+    const W=760,H=190,PAD=34,max=Math.max(...L.map(l=>l.count));
+    const x=i=>PAD+i*(W-PAD*2)/Math.max(1,L.length-1);
+    const y=v=>H-28-(v/max)*(H-58);
+    const pts=L.map((l,i)=>`${x(i)},${y(l.count)}`).join(" ");
+    const area=`${PAD},${H-28} ${pts} ${x(L.length-1)},${H-28}`;
+    document.getElementById("launch").innerHTML=
+      `<svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="Products published per month">
+        <polygon points="${area}" fill="#B07BE8" opacity=".18"/>
+        <polyline points="${pts}" fill="none" stroke="#5B3FA8" stroke-width="2.5"
+          stroke-linejoin="round" stroke-linecap="round"/>
+        ${L.map((l,i)=>`<circle cx="${x(i)}" cy="${y(l.count)}" r="4" fill="#5B3FA8">
+          <title>${l.month}: ${l.count} products</title></circle>`).join("")}
+        ${L.map((l,i)=>i%Math.ceil(L.length/6)===0
+          ?`<text x="${x(i)}" y="${H-8}" font-size="10" fill="#7A6B9E"
+             text-anchor="middle" font-family="Outfit,sans-serif">${l.month}</text>`:"").join("")}
+        <text x="${PAD}" y="16" font-size="10" fill="#7A6B9E"
+          font-family="Outfit,sans-serif">peak ${max} products</text>
+      </svg>`;
+  }
+}
+
+function renderAll(){
+  const rows=view();
+  renderKpis(rows);renderDumb(rows);renderDonut(rows);
+  renderTree(rows);renderBands(rows);renderTable(rows);
+}
+
+(function init(){
+  const label=`${PAYLOAD.source} · ${num(KPI.products)} products`;
+  document.getElementById("srcLabel").textContent=label;
+  document.getElementById("footSrc").textContent="Source: "+label;
+  const cats=[...new Set(DATA.map(r=>r.c).filter(c=>c&&c!=="Uncategorised"))].sort();
+  const sel=document.getElementById("catSel");
+  if(cats.length>1){sel.innerHTML='<option value="all">All categories</option>'+
+    cats.map(c=>`<option value="${esc(c)}">${esc(c)}</option>`).join("")}
+  else sel.style.display="none";
+  document.querySelectorAll(".chip").forEach(c=>c.addEventListener("click",()=>{
+    document.querySelectorAll(".chip").forEach(o=>o.setAttribute("aria-pressed","false"));
+    c.setAttribute("aria-pressed","true");band=c.dataset.band;page=0;renderAll()}));
+  document.getElementById("topSel").addEventListener("change",e=>{topN=+e.target.value;renderAll()});
+  sel.addEventListener("change",e=>{cat=e.target.value;page=0;renderAll()});
+  let t;document.getElementById("search").addEventListener("input",e=>{
+    clearTimeout(t);t=setTimeout(()=>{query=e.target.value;page=0;renderAll()},180)});
+  let rt;window.addEventListener("resize",()=>{clearTimeout(rt);rt=setTimeout(()=>renderTree(view()),140)});
+  renderInsights();renderTrends();renderAll();
+})();
+</script></body></html>
+"""
+
+
+# ======================================================================
+# 5. MAIN
+# ======================================================================
+def main():
+    ap = argparse.ArgumentParser(description="Scrape, clean, analyse and build the dashboard.")
+    ap.add_argument("--offline", metavar="CSV", help="use an existing CSV instead of scraping")
+    ap.add_argument("--limit", type=int, default=50, help="max pages to scrape")
+    ap.add_argument("--collection", default=COLLECTION)
+    ap.add_argument("--no-sentiment", action="store_true")
+    ap.add_argument("--no-charts", action="store_true", help="skip the PNG charts")
+    args = ap.parse_args()
+
+    if args.offline:
+        print(f"Reading {args.offline}")
+        raw = pd.read_csv(args.offline)
+        source = Path(args.offline).stem
+    else:
+        print(f"Scraping /collections/{args.collection}/products.json")
+        raw = fetch_products(args.collection, args.limit)
+        source = f"salty.co.in/{args.collection}"
+
+    if raw.empty:
+        sys.exit("No products fetched. Check the collection name or your connection.")
+
+    print(f"\nCleaning {len(raw)} rows")
+    df = clean(raw)
+    if not args.no_sentiment:
+        df = add_sentiment(df)
+    print(f"  {len(df)} rows kept")
+
+    df.to_csv(OUT / "salty_cleaned.csv", index=False, encoding="utf-8-sig")
+
+    kpis, insights = analyse(df)
+
+    tr = trend_analysis(df)
+    insights = insights + trend_insights(df, tr)
+
+    (OUT / "salty_insights.json").write_text(
+        json.dumps({"kpis": kpis, "insights": insights, "trends": tr},
+                   indent=2, ensure_ascii=False, default=str),
+        encoding="utf-8")
+
+    charts = [] if args.no_charts else plot_charts(df, tr)
+    path = build_dashboard(df, kpis, insights, source, tr)
+
+    print("\n" + "=" * 62)
+    print(f"  Products        {kpis['products']:,}")
+    print(f"  Categories      {kpis['categories']}")
+    print(f"  Average price   Rs.{kpis['average_price']:,.0f}   (median Rs.{kpis['median_price']:,.0f})")
+    print(f"  Price range     Rs.{kpis['lowest_price']:,.0f} – Rs.{kpis['highest_price']:,.0f}")
+    print(f"  Total savings   Rs.{kpis['total_savings']:,.0f}")
+    print(f"  Blended discount {kpis['blended_discount']}%")
+    print("=" * 62)
+
+    if tr["motifs"]:
+        print("\n  Top motifs")
+        for m in tr["motifs"][:6]:
+            sold = f"  {m['sold_out']:>5}% sold out" if "sold_out" in m else ""
+            print(f"    {m['term']:<14} {m['count']:>4} products  "
+                  f"Rs.{m['avg_price']:>6,}  {m['avg_discount']:>3}% off{sold}")
+
+    if tr["colours"]:
+        print("\n  Colours: " + ", ".join(f"{c['term']} ({c['count']})" for c in tr["colours"][:6]))
+    if tr["materials"]:
+        print("  Materials: " + ", ".join(f"{m['term']} ({m['count']})" for m in tr["materials"][:6]))
+    if tr.get("recent_share") is not None:
+        print(f"\n  {tr['recent_share']}% of the catalogue was published in the last 90 days")
+
+    print(f"\n  {len(insights)} findings:")
+    for i in insights:
+        print(f"    • {i['title']}")
+
+    print(f"\n  salty_cleaned.csv")
+    print(f"  salty_insights.json")
+    print(f"  {path.name}")
+    for c in charts:
+        print(f"  charts/{c.name}")
+
+
+if __name__ == "__main__":
+    main()
