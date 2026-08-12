@@ -10,6 +10,8 @@ An interactive web version of this dashboard is available as a standalone HTML p
 
 File: `fashion_analytics_dashboard.html` — open it directly in any browser, no Power BI Desktop required.
 
+Power BI report: [Fashion Analytics Dashboard.pbix](https://github.com/AnuSHAR-214/Fashion-Analysis---On-Salty-alpha---Project-5/raw/main/Fashion%20Analytics%20Dashboard.pbix) — download and open in Power BI Desktop for the full interactive report.
+
 ---
 
 ## Overview
