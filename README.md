@@ -8,6 +8,8 @@ An interactive web version of this dashboard is available as a standalone HTML p
 
 **[View Live Dashboard](https://anushar-214.github.io/Fashion-Analysis---On-Salty-alpha---Project-5/fashion_analytics_dashboard.html)**
 
+**[View Live Power BI Dashboard](https://app.powerbi.com/groups/a8b4bc89-bce5-4add-a0cb-f3674a2355e8/reports/c2e27614-62f3-448f-b738-6abfae0cdb0a?ctid=d3de91d7-5bb6-4ce1-a775-489e8e7143a8&pbi_source=linkShare)** — published on Power BI Service (sign-in with access required)
+
 File: `fashion_analytics_dashboard.html` — open it directly in any browser, no Power BI Desktop required.
 
 Power BI report: [Fashion Analytics Dashboard.pbix](https://github.com/AnuSHAR-214/Fashion-Analysis---On-Salty-alpha---Project-5/raw/main/Fashion%20Analytics%20Dashboard.pbix) — download and open in Power BI Desktop for the full interactive report.
